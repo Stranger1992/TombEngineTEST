@@ -38,7 +38,7 @@ jobs:
           if (-not (Test-Path $msbuild)) { Write-Error "MSBuild.exe not found at $msbuild"; exit 1 }
 
           # Solution path inside the repo (adjust if your layout differs)
-          $solutionPath = 'TombEngine\TombEngine.sln'
+          $solutionPath = 'TombEngine.sln'
           if (-not (Test-Path $solutionPath)) {
             Write-Host "Solution not found at $solutionPath. Listing repo root for diagnosis:"
             Get-ChildItem -Force | Format-Table Name,Mode
