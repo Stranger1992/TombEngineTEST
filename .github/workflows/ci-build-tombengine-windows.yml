@@ -19,6 +19,15 @@ jobs:
         run: |
           Write-Host "vswhere (MSBuild-capable installations):"
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.Component.MSBuild -property installationPath
+     
+      - name: Setup NuGet (tool)
+        uses: NuGet/setup-nuget@v1
+      
+      - name: Restore NuGet packages (solution-level)
+        shell: pwsh
+        run: |
+          # restore packages for the solution (adjust path if solution is in subfolder)
+          nuget restore "TombEngine\TombEngine.sln" -NonInteractive
 
       - name: Confirm repo layout (diagnostic)
         shell: pwsh
