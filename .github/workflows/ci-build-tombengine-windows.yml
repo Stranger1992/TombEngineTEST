@@ -1,0 +1,244 @@
+name: CI Build Tomb Engine (Windows)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup NuGet tool
+        uses: NuGet/setup-nuget@v1
+
+      - name: Diagnose Visual Studio installations
+        shell: pwsh
+        run: |
+          Write-Host "vswhere (MSBuild-capable installations):"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.Component.MSBuild -property installationPath
+
+      - name: Find solution and prepare packages
+        id: find_and_prepare
+        shell: pwsh
+        run: |
+          Write-Host "Locating a .sln file in the repository..."
+          $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sln) {
+            Write-Host "No .sln file found in repository. Aborting."
+            exit 1
+          }
+
+          # Resolve to absolute path and compute relative path from repo root
+          $slnFull = (Resolve-Path $sln.FullName).Path
+          $repoRoot = (Get-Location).Path
+          $slnRelative = $slnFull.Substring($repoRoot.Length + 1)
+          Write-Host "Found solution (relative): $slnRelative"
+          Write-Host "Found solution (absolute): $slnFull"
+
+          # Compute solution directory robustly
+          $slnDir = Split-Path -Path $slnFull -Parent
+          if ([string]::IsNullOrWhiteSpace($slnDir)) {
+            $slnDir = $repoRoot
+            Write-Host "Solution parent was empty; using repo root as solution directory: $slnDir"
+          } else {
+            Write-Host "Solution directory: $slnDir"
+          }
+
+          # Export outputs for later steps
+          Write-Output "solutionPath=$slnRelative" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "solutionDir=$slnDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          # Ensure packages folder exists and check for Microsoft.XAudio2.Redist
+          $packagesDir = Join-Path $slnDir "packages"
+          Write-Host "Expected packages folder: $packagesDir"
+          $pkgPattern = Join-Path $packagesDir "Microsoft.XAudio2.Redist.*"
+
+          if (-not (Test-Path $packagesDir) -or -not (Get-ChildItem -Path $pkgPattern -ErrorAction SilentlyContinue)) {
+            Write-Host "Microsoft.XAudio2.Redist not found; installing into solution packages folder..."
+            $tempOut = Join-Path $PWD "nuget_temp_packages"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempOut
+            New-Item -ItemType Directory -Path $tempOut | Out-Null
+            nuget install Microsoft.XAudio2.Redist -Version 1.2.10 -OutputDirectory $tempOut -NonInteractive
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "nuget install returned exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
+            New-Item -ItemType Directory -Path $packagesDir -Force | Out-Null
+            Get-ChildItem -Path $tempOut -Directory | ForEach-Object {
+              $dest = Join-Path $packagesDir $_.Name
+              if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+              Move-Item -Path $_.FullName -Destination $dest
+            }
+            Remove-Item -Recurse -Force $tempOut
+            Write-Host "Microsoft.XAudio2.Redist installed into $packagesDir"
+          } else {
+            Write-Host "Microsoft.XAudio2.Redist already present under $packagesDir"
+          }
+
+      - name: Restore NuGet packages for discovered solution
+        shell: pwsh
+        run: |
+          $solutionPath = "${{ steps.find_and_prepare.outputs.solutionPath }}"
+          if (-not $solutionPath) { Write-Error "No solution path discovered"; exit 1 }
+          Write-Host "Restoring NuGet packages for solution: $solutionPath"
+          nuget restore $solutionPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { Write-Host "nuget restore returned exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      - name: Verify restored packages (diagnostic)
+        shell: pwsh
+        run: |
+          $solutionDir = "${{ steps.find_and_prepare.outputs.solutionDir }}"
+          $packagesRoot = Join-Path $solutionDir "packages"
+          Write-Host "Looking for packages under: $packagesRoot"
+          if (Test-Path $packagesRoot) {
+            Get-ChildItem -Path $packagesRoot -Directory -ErrorAction SilentlyContinue | Select-Object Name | Format-Table
+          } else {
+            Write-Host "No packages folder found at expected location. Listing $solutionDir contents:"
+            Get-ChildItem -Path $solutionDir -Force | Select-Object Name,Mode | Format-Table
+          }
+          Write-Host "Check for Microsoft.XAudio2.Redist files:"
+          Get-ChildItem -Path (Join-Path $packagesRoot "Microsoft.XAudio2.Redist*") -Recurse -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+
+      - name: Build solution with MSBuild
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) { Write-Error "vswhere did not find Visual Studio with MSBuild."; exit 1 }
+          $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
+          if (-not (Test-Path $msbuild)) { Write-Error "MSBuild.exe not found at $msbuild"; exit 1 }
+
+          $solutionPath = "${{ steps.find_and_prepare.outputs.solutionPath }}"
+          if (-not (Test-Path $solutionPath)) {
+            Write-Host "Solution not found at $solutionPath. Listing repo root for diagnosis:"
+            Get-ChildItem -Force | Format-Table Name,Mode
+            exit 1
+          }
+
+          $logFile = Join-Path $PWD "msbuild_tombengine.log"
+          $args = @(
+            "`"$solutionPath`"",
+            "/t:Rebuild",
+            "/p:Configuration=Release",
+            "/m",
+            "/v:minimal",
+            "/clp:Summary",
+            "/fl",
+            "/flp:logfile=$logFile;verbosity=diagnostic"
+          )
+
+          Write-Host "Running MSBuild: $msbuild $($args -join ' ')"
+          $proc = Start-Process -FilePath $msbuild -ArgumentList $args -Wait -NoNewWindow -PassThru
+          $exitCode = $proc.ExitCode
+
+          New-Item -ItemType Directory -Path build_logs -Force | Out-Null
+          if (Test-Path $logFile) {
+            Copy-Item -Path $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force
+            Write-Host "MSBuild log copied to build_logs"
+          } else {
+            Write-Host "MSBuild log not found at $logFile; creating placeholder log"
+            New-Item -Path (Join-Path build_logs "msbuild_tombengine.log") -ItemType File -Force | Out-Null
+          }
+
+          if ($exitCode -ne 0) {
+            Write-Host "MSBuild exited with code $exitCode"
+            exit $exitCode
+          }
+
+      - name: Show potential outputs for debugging
+        shell: pwsh
+        run: |
+          Write-Host "Listing Release and Build folders (may include net48/net6.0 subfolders):"
+          Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+          Get-ChildItem -Path . -Recurse -Filter Build -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+
+      - name: Stage compiled runtime outputs (robocopy)
+        shell: pwsh
+        run: |
+          function ts { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+          Write-Host "$(ts) - Start staging compiled outputs"
+
+          $slnDir = "${{ steps.find_and_prepare.outputs.solutionDir }}"
+          if (-not $slnDir) { $slnDir = (Get-Location).Path; Write-Host "Falling back to repo root: $slnDir" }
+
+          $staging = Join-Path $PWD "artifact_staging"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $staging
+          New-Item -ItemType Directory -Path $staging | Out-Null
+
+          # Candidate runtime folders (adjust if your build writes elsewhere)
+          $candidates = @()
+          $buildReleaseBin = Join-Path $slnDir "Build\Release\Bin"
+          if (Test-Path $buildReleaseBin) { $candidates += (Resolve-Path $buildReleaseBin).Path }
+
+          # Some builds put outputs under Build\Release\Bin\x64 or x86; include those if present
+          if (Test-Path (Join-Path $buildReleaseBin "x64")) { $candidates += (Resolve-Path (Join-Path $buildReleaseBin "x64")).Path }
+          if (Test-Path (Join-Path $buildReleaseBin "x86")) { $candidates += (Resolve-Path (Join-Path $buildReleaseBin "x86")).Path }
+
+          # Also include TombEngine\Release and its Bin/Scripts/Shaders if present
+          $projRelease = Join-Path $slnDir "TombEngine\Release"
+          if (Test-Path $projRelease) { $candidates += (Resolve-Path $projRelease).Path }
+          if (Test-Path (Join-Path $projRelease "Bin")) { $candidates += (Resolve-Path (Join-Path $projRelease "Bin")).Path }
+          if (Test-Path (Join-Path $projRelease "Scripts")) { $candidates += (Resolve-Path (Join-Path $projRelease "Scripts")).Path }
+          if (Test-Path (Join-Path $projRelease "Shaders")) { $candidates += (Resolve-Path (Join-Path $projRelease "Shaders")).Path }
+
+          # Optional runtime folders under Build\Release
+          $maybeScripts = Join-Path $slnDir "Build\Release\Scripts"
+          if (Test-Path $maybeScripts) { $candidates += (Resolve-Path $maybeScripts).Path }
+          $maybeShaders = Join-Path $slnDir "Build\Release\Shaders"
+          if (Test-Path $maybeShaders) { $candidates += (Resolve-Path $maybeShaders).Path }
+
+          # Deduplicate and normalize
+          $unique = $candidates | ForEach-Object { (Resolve-Path $_).Path } | Sort-Object -Unique
+
+          if ($unique.Count -eq 0) {
+            Write-Host "$(ts) - No compiled outputs found; aborting packaging"
+            exit 1
+          }
+
+          Write-Host "$(ts) - Staging the following runtime folders:"
+          $unique | ForEach-Object { Write-Host "  $_" }
+
+          foreach ($src in $unique) {
+            $leaf = Split-Path -Path $src -Leaf
+            $dest = Join-Path $staging $leaf
+            Write-Host "$(ts) - Robocopy $src -> $dest"
+            robocopy $src $dest /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
+            $rc = $LASTEXITCODE
+            Write-Host "$(ts) - robocopy exit code: $rc"
+            if ($rc -ge 8) { Write-Host "$(ts) - robocopy failure ($rc)"; exit $rc }
+          }
+
+          Write-Host "$(ts) - Staged file count and sample listing:"
+          Get-ChildItem -Path $staging -Recurse -File | Select-Object FullName,Length | Sort-Object Length -Descending | Format-Table -AutoSize -Wrap
+          # Robocopy exits with 1 when files are copied successfully (exit codes 0-7 are non-error).
+          # Reset exit code so GitHub Actions does not treat a successful copy as a failure.
+          exit 0
+
+      - name: Create runtime artifact zip
+        shell: pwsh
+        run: |
+          $zipName = "tombengine_runtime_${{ github.run_id }}.zip"
+          Write-Host "Compressing artifact_staging -> $zipName"
+          Compress-Archive -Path (Join-Path $PWD "artifact_staging\*") -DestinationPath $zipName -Force -CompressionLevel Optimal
+          New-Item -ItemType Directory -Path build_artifacts -Force | Out-Null
+          Move-Item -Path $zipName -Destination (Join-Path build_artifacts $zipName) -Force
+          Write-Host "Compression complete. Artifact: build_artifacts\$zipName"
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-runtime-${{ github.run_id }}
+          path: build_artifacts
+
+      - name: Upload MSBuild logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-msbuild-log-${{ github.run_id }}
+          path: build_logs
