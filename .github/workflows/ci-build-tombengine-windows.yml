@@ -10,39 +10,81 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - name: Checkout
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Diagnose VS installations
+      - name: Diagnose Visual Studio installations
         shell: pwsh
         run: |
+          Write-Host "vswhere (MSBuild-capable installations):"
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.Component.MSBuild -property installationPath
+
+      - name: Confirm repo layout (diagnostic)
+        shell: pwsh
+        run: |
+          Write-Host "Top-level files and folders:"
+          Get-ChildItem -Force | Select-Object Name,Mode | Format-Table
+          Write-Host "Show TombEngine folder tree (depth 2):"
+          if (Test-Path .\TombEngine) { Get-ChildItem .\TombEngine -Recurse -Depth 2 | Select-Object FullName,Mode | Format-Table } else { Write-Host "No TombEngine folder at repo root" }
 
       - name: Build TombEngine.sln with MSBuild
         shell: pwsh
         run: |
+          # Locate Visual Studio with MSBuild
           $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
           if (-not $vsPath) { Write-Error "vswhere did not find Visual Studio with MSBuild."; exit 1 }
           $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
           if (-not (Test-Path $msbuild)) { Write-Error "MSBuild.exe not found at $msbuild"; exit 1 }
 
-          $solution = '"TombEngine.sln"'
+          # Solution path inside the repo (adjust if your layout differs)
+          $solutionPath = 'TombEngine\TombEngine.sln'
+          if (-not (Test-Path $solutionPath)) {
+            Write-Host "Solution not found at $solutionPath. Listing repo root for diagnosis:"
+            Get-ChildItem -Force | Format-Table Name,Mode
+            exit 1
+          }
+
+          # Absolute log path
           $logFile = Join-Path $PWD "msbuild_tombengine.log"
-          $argString = "$solution /t:Rebuild /p:Configuration=Release /m /v:minimal /clp:Summary /fl /flp:logfile=$logFile;verbosity=diagnostic"
 
-          Write-Host "Running MSBuild: $msbuild $argString"
-          & $msbuild --% $argString
-          $exitCode = $LASTEXITCODE
+          # Build args: quote the solution so spaces are preserved; quote /flp argument so semicolon isn't split
+          $args = @(
+            "`"$solutionPath`"",
+            "/t:Rebuild",
+            "/p:Configuration=Release",
+            "/m",
+            "/v:minimal",
+            "/clp:Summary",
+            "/fl",
+            "/flp:logfile=$logFile;verbosity=diagnostic"
+          )
 
+          Write-Host "Running MSBuild: $msbuild $($args -join ' ')"
+          $proc = Start-Process -FilePath $msbuild -ArgumentList $args -Wait -NoNewWindow -PassThru
+          $exitCode = $proc.ExitCode
+
+          # Ensure build_logs exists and copy the log if present; create placeholder if not
           New-Item -ItemType Directory -Path build_logs -Force | Out-Null
-          if (Test-Path $logFile) { Copy-Item $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force } else { New-Item -Path (Join-Path build_logs "msbuild_tombengine.log") -ItemType File -Force | Out-Null }
+          if (Test-Path $logFile) {
+            Copy-Item -Path $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force
+            Write-Host "MSBuild log copied to build_logs"
+          } else {
+            Write-Host "MSBuild log not found at $logFile; creating placeholder log"
+            New-Item -Path (Join-Path build_logs "msbuild_tombengine.log") -ItemType File -Force | Out-Null
+          }
 
-          if ($exitCode -ne 0) { Write-Host "MSBuild exited with code $exitCode"; exit $exitCode }
+          if ($exitCode -ne 0) {
+            Write-Host "MSBuild exited with code $exitCode"
+            exit $exitCode
+          }
 
-      - name: Show outputs
+      - name: Show potential outputs for debugging
         shell: pwsh
         run: |
-          Get-ChildItem -Path . -Recurse -Filter Release -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+          Write-Host "Searching for Build and Release folders:"
+          Get-ChildItem -Path . -Recurse -Filter Build -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+          Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
 
       - name: Upload MSBuild logs
         uses: actions/upload-artifact@v4
@@ -50,14 +92,27 @@ jobs:
           name: tombengine-msbuild-log-${{ github.run_id }}
           path: build_logs
 
-      - name: Package Build folder
+      - name: Package Build or Release outputs
         shell: pwsh
         run: |
-          $out = "tombengine_build_${{ github.run_id }}.zip"
-          # Adjust path below if the repo outputs to a different Build folder
-          if (Test-Path .\Build) { Compress-Archive -Path .\Build\* -DestinationPath $out -Force } else { Write-Host "No Build folder found; creating empty zip"; New-Item -Path $out -ItemType File -Force | Out-Null }
+          $zipName = "tombengine_build_${{ github.run_id }}.zip"
+          # Prefer a Build folder at TombEngine\Build or repo root; otherwise include any Release folders found
+          $buildCandidates = @()
+          if (Test-Path .\TombEngine\Build) { $buildCandidates += (Resolve-Path .\TombEngine\Build).Path }
+          if (Test-Path .\Build) { $buildCandidates += (Resolve-Path .\Build).Path }
+          $releaseDirs = Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          if ($releaseDirs) { $buildCandidates += $releaseDirs }
+
+          if ($buildCandidates.Count -gt 0) {
+            Write-Host "Compressing: $($buildCandidates -join '; ')"
+            Compress-Archive -Path $buildCandidates -DestinationPath $zipName -Force
+          } else {
+            Write-Host "No Build/Release outputs found; creating placeholder zip"
+            New-Item -Path $zipName -ItemType File -Force | Out-Null
+          }
+
           New-Item -ItemType Directory -Path build_artifacts -Force | Out-Null
-          Move-Item $out build_artifacts/
+          Move-Item -Path $zipName -Destination (Join-Path build_artifacts $zipName) -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
