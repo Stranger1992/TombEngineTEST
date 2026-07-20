@@ -13,7 +13,8 @@ jobs:
       - name: Checkout repository (PR head)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Compute branch name and safe name
         id: vars
