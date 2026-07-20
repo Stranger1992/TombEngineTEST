@@ -211,12 +211,14 @@ jobs:
             # Determine a stable runtime root to compute a relative path.
             # Prefer Build\Release as the root; fall back to solution dir if not under Build\Release.
             $buildReleaseRoot = Join-Path $slnDir "Build\Release"
-            if ($src.StartsWith((Resolve-Path $buildReleaseRoot).Path, [System.StringComparison]::OrdinalIgnoreCase)) {
-              $rel = $src.Substring((Resolve-Path $buildReleaseRoot).Path.Length).TrimStart('\')
+            $buildReleaseRootResolved = $null
+            if (Test-Path $buildReleaseRoot) { $buildReleaseRootResolved = (Resolve-Path $buildReleaseRoot).Path }
+            if ($buildReleaseRootResolved -and $src.StartsWith($buildReleaseRootResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+              $rel = $src.Substring($buildReleaseRootResolved.Length).TrimStart('\\')
               $stagingSub = Join-Path $staging $rel
             } else {
-              # If not under Build\Release, compute path relative to solution dir
-              $rel = $src.Substring($slnDir.Length).TrimStart('\')
+              # If not under Build\Release (or Build\Release doesn't exist), compute path relative to solution dir
+              $rel = $src.Substring($slnDir.Length).TrimStart('\\')
               $stagingSub = Join-Path $staging $rel
             }
           
