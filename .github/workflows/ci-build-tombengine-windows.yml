@@ -159,11 +159,11 @@ jobs:
           Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
           Get-ChildItem -Path . -Recurse -Filter Build -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
 
-      - name: Stage compiled runtime outputs (robocopy)
+      - name: Stage compiled runtime outputs (robocopy, runtime-only)
         shell: pwsh
         run: |
           function ts { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
-          Write-Host "$(ts) - Start staging compiled outputs"
+          Write-Host "$(ts) - Start staging compiled outputs (runtime-only)"
 
           $slnDir = "${{ steps.find_and_prepare.outputs.solutionDir }}"
           if (-not $slnDir) { $slnDir = (Get-Location).Path; Write-Host "Falling back to repo root: $slnDir" }
@@ -172,61 +172,88 @@ jobs:
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $staging
           New-Item -ItemType Directory -Path $staging | Out-Null
 
-          # Candidate runtime folders (adjust if your build writes elsewhere)
+          # Explicit runtime folders to include (only compiled outputs)
           $candidates = @()
-          $buildReleaseBin = Join-Path $slnDir "Build\Release\Bin"
-          if (Test-Path $buildReleaseBin) { $candidates += (Resolve-Path $buildReleaseBin).Path }
 
-          # Some builds put outputs under Build\Release\Bin\x64 or x86; include those if present
-          if (Test-Path (Join-Path $buildReleaseBin "x64")) { $candidates += (Resolve-Path (Join-Path $buildReleaseBin "x64")).Path }
-          if (Test-Path (Join-Path $buildReleaseBin "x86")) { $candidates += (Resolve-Path (Join-Path $buildReleaseBin "x86")).Path }
+          # Prefer Build\Release\Bin\x64 and Build\Release\Bin\x86 (if present)
+          $binRoot = Join-Path $slnDir "Build\Release\Bin"
+          if (Test-Path (Join-Path $binRoot "x64")) { $candidates += (Resolve-Path (Join-Path $binRoot "x64")).Path } else { if (Test-Path $binRoot) { $candidates += (Resolve-Path $binRoot).Path } }
+          if (Test-Path (Join-Path $binRoot "x86")) { $candidates += (Resolve-Path (Join-Path $binRoot "x86")).Path }
 
-          # Also include TombEngine\Release and its Bin/Scripts/Shaders if present
-          $projRelease = Join-Path $slnDir "TombEngine\Release"
-          if (Test-Path $projRelease) { $candidates += (Resolve-Path $projRelease).Path }
-          if (Test-Path (Join-Path $projRelease "Bin")) { $candidates += (Resolve-Path (Join-Path $projRelease "Bin")).Path }
-          if (Test-Path (Join-Path $projRelease "Scripts")) { $candidates += (Resolve-Path (Join-Path $projRelease "Scripts")).Path }
-          if (Test-Path (Join-Path $projRelease "Shaders")) { $candidates += (Resolve-Path (Join-Path $projRelease "Shaders")).Path }
+          # Include Scripts and Shaders from Build\Release if present
+          $scripts = Join-Path $slnDir "Build\Release\Scripts"
+          if (Test-Path $scripts) { $candidates += (Resolve-Path $scripts).Path }
+          $shaders = Join-Path $slnDir "Build\Release\Shaders"
+          if (Test-Path $shaders) { $candidates += (Resolve-Path $shaders).Path }
 
-          # Optional runtime folders under Build\Release
-          $maybeScripts = Join-Path $slnDir "Build\Release\Scripts"
-          if (Test-Path $maybeScripts) { $candidates += (Resolve-Path $maybeScripts).Path }
-          $maybeShaders = Join-Path $slnDir "Build\Release\Shaders"
-          if (Test-Path $maybeShaders) { $candidates += (Resolve-Path $maybeShaders).Path }
+          # Also include TombEngine\Build\Release\Bin or TombEngine\Release\Bin if project writes there
+          $altBin1 = Join-Path $slnDir "TombEngine\Build\Release\Bin"
+          if (Test-Path $altBin1) { $candidates += (Resolve-Path $altBin1).Path }
+          $altBin2 = Join-Path $slnDir "TombEngine\Release\Bin"
+          if (Test-Path $altBin2) { $candidates += (Resolve-Path $altBin2).Path }
 
-          # Deduplicate and normalize
+          # Deduplicate and normalize; remove any path that ends with a folder named "Release" (to avoid copying source tree)
           $unique = $candidates | ForEach-Object { (Resolve-Path $_).Path } | Sort-Object -Unique
+          $filtered = $unique | Where-Object { -not ([IO.Path]::GetFileName($_) -ieq 'Release') }
 
-          if ($unique.Count -eq 0) {
-            Write-Host "$(ts) - No compiled outputs found; aborting packaging"
+          if ($filtered.Count -eq 0) {
+            Write-Host "$(ts) - No compiled runtime outputs found; aborting packaging"
             exit 1
           }
 
-          Write-Host "$(ts) - Staging the following runtime folders:"
-          $unique | ForEach-Object { Write-Host "  $_" }
+          Write-Host "$(ts) - Staging the following runtime folders (filtered):"
+          $filtered | ForEach-Object { Write-Host "  $_" }
 
-          foreach ($src in $unique) {
-            $leaf = Split-Path -Path $src -Leaf
-            $dest = Join-Path $staging $leaf
-            Write-Host "$(ts) - Robocopy $src -> $dest"
-            robocopy $src $dest /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
+          # Replace the existing foreach loop with this block
+          foreach ($src in $filtered) {
+            Write-Host "$(ts) - Processing source: $src"
+          
+            # Determine a stable runtime root to compute a relative path.
+            # Prefer Build\Release as the root; fall back to solution dir if not under Build\Release.
+            $buildReleaseRoot = Join-Path $slnDir "Build\Release"
+            $buildReleaseRootResolved = $null
+            if (Test-Path $buildReleaseRoot) { $buildReleaseRootResolved = (Resolve-Path $buildReleaseRoot).Path }
+            if ($buildReleaseRootResolved -and $src.StartsWith($buildReleaseRootResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+              $rel = $src.Substring($buildReleaseRootResolved.Length).TrimStart('\\')
+              $stagingSub = Join-Path $staging $rel
+            } else {
+              # If not under Build\Release (or Build\Release doesn't exist), compute path relative to solution dir
+              $rel = $src.Substring($slnDir.Length).TrimStart('\\')
+              $stagingSub = Join-Path $staging $rel
+            }
+          
+            # Ensure destination folder exists
+            New-Item -ItemType Directory -Path $stagingSub -Force | Out-Null
+          
+            Write-Host "$(ts) - Robocopy $src -> $stagingSub"
+            robocopy $src $stagingSub /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
             $rc = $LASTEXITCODE
             Write-Host "$(ts) - robocopy exit code: $rc"
             if ($rc -ge 8) { Write-Host "$(ts) - robocopy failure ($rc)"; exit $rc }
           }
-
+          
           Write-Host "$(ts) - Staged file count and sample listing:"
           Get-ChildItem -Path $staging -Recurse -File | Select-Object FullName,Length | Sort-Object Length -Descending | Format-Table -AutoSize -Wrap
-          # Robocopy exits with 1 when files are copied successfully (exit codes 0-7 are non-error).
-          # Reset exit code so GitHub Actions does not treat a successful copy as a failure.
+
+          # Robocopy returns non-zero codes for successful copies; ensure step exits 0
           exit 0
 
-      - name: Create runtime artifact zip
+      - name: Create runtime artifact zip (single-level, no nested zips)
         shell: pwsh
         run: |
           $zipName = "tombengine_runtime_${{ github.run_id }}.zip"
           Write-Host "Compressing artifact_staging -> $zipName"
+
+          # Ensure there are no existing zip files inside staging (avoid zip-in-zip)
+          $innerZips = Get-ChildItem -Path artifact_staging -Recurse -Filter *.zip -ErrorAction SilentlyContinue
+          if ($innerZips) {
+            Write-Host "Removing inner zip files from staging to avoid nested zips:"
+            $innerZips | ForEach-Object { Write-Host "  Removing $($_.FullName)"; Remove-Item -Force $_.FullName }
+          }
+
+          # Compress only the contents of artifact_staging (single-level zip)
           Compress-Archive -Path (Join-Path $PWD "artifact_staging\*") -DestinationPath $zipName -Force -CompressionLevel Optimal
+
           New-Item -ItemType Directory -Path build_artifacts -Force | Out-Null
           Move-Item -Path $zipName -Destination (Join-Path build_artifacts $zipName) -Force
           Write-Host "Compression complete. Artifact: build_artifacts\$zipName"
@@ -242,3 +269,5 @@ jobs:
         with:
           name: tombengine-msbuild-log-${{ github.run_id }}
           path: build_logs
+
+          

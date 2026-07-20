@@ -1,0 +1,175 @@
+name: PR Build TombEngine (Windows)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  build-and-attach:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository (PR head)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Compute branch name and safe name
+        id: vars
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_HEAD_REF) {
+            $branch = $env:GITHUB_HEAD_REF
+          } else {
+            $branch = $env:GITHUB_REF -replace '^refs/heads/','' -replace '^refs/tags/',''
+          }
+          $safe = $branch -replace '[^A-Za-z0-9._-]','-' -replace '^-+','' -replace '-+$',''
+          if (-not $safe) { $safe = 'unknown' }
+          Write-Output "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "safeBranch=$safe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Branch: $branch (safe: $safe)"
+
+      - name: Restore NuGet if needed
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sln) {
+            $slnRel = (Resolve-Path $sln.FullName).Path.Substring((Get-Location).Path.Length + 1)
+            Write-Host "Restoring NuGet for $slnRel"
+            nuget restore $slnRel -NonInteractive
+          } else {
+            Write-Host "No .sln found; skipping nuget restore"
+          }
+
+      - name: Build solution with MSBuild
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) { Write-Error "vswhere did not find Visual Studio with MSBuild."; exit 1 }
+          $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
+          $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sln) { Write-Error "No .sln found to build"; exit 1 }
+          $slnRel = (Resolve-Path $sln.FullName).Path.Substring((Get-Location).Path.Length + 1)
+          $logFile = Join-Path $PWD "msbuild_tombengine.log"
+          $args = @(
+            "`"$slnRel`"",
+            "/t:Rebuild",
+            "/p:Configuration=Release",
+            "/m",
+            "/v:minimal",
+            "/clp:Summary",
+            "/fl",
+            "/flp:logfile=$logFile;verbosity=diagnostic"
+          )
+          Write-Host "Running MSBuild: $msbuild $($args -join ' ')"
+          $proc = Start-Process -FilePath $msbuild -ArgumentList $args -Wait -NoNewWindow -PassThru
+          $exitCode = $proc.ExitCode
+          New-Item -ItemType Directory -Path build_logs -Force | Out-Null
+          if (Test-Path $logFile) {
+            Copy-Item -Path $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force
+          }
+          if ($exitCode -ne 0) {
+            Write-Host "MSBuild exited with code $exitCode"
+            exit $exitCode
+          }
+
+      - name: Stage runtime outputs preserve Bin\x64 layout
+        shell: pwsh
+        run: |
+          function ts { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+          $safe = "${{ steps.vars.outputs.safeBranch }}"
+          $slnDir = (Get-Location).Path
+          $stagingRoot = Join-Path $PWD "artifact_staging"
+          $staging = Join-Path $stagingRoot "TombEngine_$safe"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stagingRoot
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $candidates = @()
+          $binRoot = Join-Path $slnDir "Build\Release\Bin"
+          if (Test-Path (Join-Path $binRoot "x64")) { $candidates += (Resolve-Path (Join-Path $binRoot "x64")).Path } elseif (Test-Path $binRoot) { $candidates += (Resolve-Path $binRoot).Path }
+          if (Test-Path (Join-Path $binRoot "x86")) { $candidates += (Resolve-Path (Join-Path $binRoot "x86")).Path }
+          $scripts = Join-Path $slnDir "Build\Release\Scripts"
+          if (Test-Path $scripts) { $candidates += (Resolve-Path $scripts).Path }
+          $shaders = Join-Path $slnDir "Build\Release\Shaders"
+          if (Test-Path $shaders) { $candidates += (Resolve-Path $shaders).Path }
+          $unique = $candidates | ForEach-Object { (Resolve-Path $_).Path } | Sort-Object -Unique
+          if ($unique.Count -eq 0) {
+            Write-Host "$(ts) - No compiled runtime outputs found; aborting packaging"
+            exit 1
+          }
+          Write-Host "$(ts) - Staging the following runtime folders:"
+          $unique | ForEach-Object { Write-Host "  $_" }
+          $buildReleaseRoot = Join-Path $slnDir "Build\Release"
+          $buildReleaseRootResolved = $null
+          if (Test-Path $buildReleaseRoot) { $buildReleaseRootResolved = (Resolve-Path $buildReleaseRoot).Path }
+          foreach ($src in $unique) {
+            if ($buildReleaseRootResolved -and $src.StartsWith($buildReleaseRootResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+              $rel = $src.Substring($buildReleaseRootResolved.Length).TrimStart('\')
+              $dest = Join-Path $staging $rel
+            } else {
+              $rel = $src.Substring($slnDir.Length).TrimStart('\')
+              $dest = Join-Path $staging $rel
+            }
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Write-Host "$(ts) - Robocopy $src -> $dest"
+            robocopy $src $dest /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
+            $rc = $LASTEXITCODE
+            Write-Host "$(ts) - robocopy exit code: $rc"
+            if ($rc -ge 8) { Write-Host "$(ts) - robocopy failure ($rc)"; exit $rc }
+          }
+          Write-Host "$(ts) - Staged file count and sample listing:"
+          Get-ChildItem -Path $staging -Recurse -File | Select-Object FullName,Length | Sort-Object Length -Descending | Format-Table -AutoSize -Wrap
+
+      - name: Create runtime artifact zip named by branch
+        shell: pwsh
+        run: |
+          $safe = "${{ steps.vars.outputs.safeBranch }}"
+          $zipName = "TombEngine_${safe}.zip"
+          Write-Host "Compressing artifact_staging -> $zipName"
+          $innerZips = Get-ChildItem -Path artifact_staging -Recurse -Filter *.zip -ErrorAction SilentlyContinue
+          if ($innerZips) { $innerZips | ForEach-Object { Remove-Item -Force $_.FullName } }
+          Compress-Archive -Path (Join-Path $PWD "artifact_staging\*") -DestinationPath $zipName -Force -CompressionLevel Optimal
+          New-Item -ItemType Directory -Path build_artifacts -Force | Out-Null
+          Move-Item -Path $zipName -Destination (Join-Path build_artifacts $zipName) -Force
+          Write-Host "Compression complete. Artifact: build_artifacts\$zipName"
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-runtime-${{ steps.vars.outputs.safeBranch }}
+          path: build_artifacts
+
+      - name: Post comment on PR with run link and artifact name
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const branch = '${{ steps.vars.outputs.branch }}';
+            const safe = '${{ steps.vars.outputs.safeBranch }}';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const artifactName = `TombEngine_${safe}.zip`;
+            const body = `Built TombEngine for branch **${branch}**.\n\nDownload the artifact from the workflow run: ${runUrl}\n\nArtifact name: \`${artifactName}\``;
+            const issue_number = context.payload.pull_request.number;
+            await github.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });
+
+      - name: Upload MSBuild logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-msbuild-log-${{ github.run_id }}
+          path: build_logs
+          
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.sln', '**/*.csproj', '**/packages.config') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
