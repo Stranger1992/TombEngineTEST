@@ -1,0 +1,216 @@
+name: PR Build TombEngine (Windows)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build-and-attach:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository (PR head if PR)
+        uses: actions/checkout@v4
+        with:
+          # If this is a PR, github.head_ref contains the branch name to build.
+          # Expression falls back to github.ref for push/workflow_dispatch.
+          ref: ${{ github.head_ref != '' && github.head_ref || github.ref }}
+
+      - name: Compute branch name and safe name
+        id: vars
+        shell: pwsh
+        run: |
+          # Determine branch: prefer PR head, then event ref
+          if ($env:GITHUB_HEAD_REF) {
+            $branch = $env:GITHUB_HEAD_REF
+          } else {
+            $branch = $env:GITHUB_REF -replace '^refs/heads/','' -replace '^refs/tags/',''
+          }
+
+          # Sanitize branch name for filenames (replace slashes and unsafe chars)
+          $safe = $branch -replace '[^A-Za-z0-9._-]','-' -replace '^-+','' -replace '-+$',''
+          if (-not $safe) { $safe = 'unknown' }
+
+          Write-Output "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "safeBranch=$safe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Branch: $branch (safe: $safe)"
+
+      - name: Restore NuGet (if needed)
+        shell: pwsh
+        run: |
+          # If your repo needs nuget restore, run it here against the discovered .sln.
+          # This example attempts to find the first .sln and restore it.
+          $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sln) {
+            $slnRel = (Resolve-Path $sln.FullName).Path.Substring((Get-Location).Path.Length + 1)
+            Write-Host "Restoring NuGet for $slnRel"
+            nuget restore $slnRel -NonInteractive
+          } else {
+            Write-Host "No .sln found; skipping nuget restore"
+          }
+
+      - name: Build solution with MSBuild
+        shell: pwsh
+        run: |
+          # Locate MSBuild
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) { Write-Error "vswhere did not find Visual Studio with MSBuild."; exit 1 }
+          $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
+
+          # Find solution
+          $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sln) { Write-Error "No .sln found to build"; exit 1 }
+          $slnRel = (Resolve-Path $sln.FullName).Path.Substring((Get-Location).Path.Length + 1)
+
+          $logFile = Join-Path $PWD "msbuild_tombengine.log"
+          $args = @(
+            "`"$slnRel`"",
+            "/t:Rebuild",
+            "/p:Configuration=Release",
+            "/m",
+            "/v:minimal",
+            "/clp:Summary",
+            "/fl",
+            "/flp:logfile=$logFile;verbosity=diagnostic"
+          )
+
+          Write-Host "Running MSBuild: $msbuild $($args -join ' ')"
+          $proc = Start-Process -FilePath $msbuild -ArgumentList $args -Wait -NoNewWindow -PassThru
+          $exitCode = $proc.ExitCode
+
+          New-Item -ItemType Directory -Path build_logs -Force | Out-Null
+          if (Test-Path $logFile) {
+            Copy-Item -Path $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force
+          }
+
+          if ($exitCode -ne 0) {
+            Write-Host "MSBuild exited with code $exitCode"
+            exit $exitCode
+          }
+
+      - name: Stage runtime outputs (preserve Bin\x64 layout)
+        shell: pwsh
+        run: |
+          function ts { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+          $safe = "${{ steps.vars.outputs.safeBranch }}"
+          $slnDir = (Get-Location).Path
+          $stagingRoot = Join-Path $PWD "artifact_staging"
+          $staging = Join-Path $stagingRoot "TombEngine_$safe"
+
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stagingRoot
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+
+          # Explicit runtime folders to include (adjust if your build writes elsewhere)
+          $candidates = @()
+          $binRoot = Join-Path $slnDir "Build\Release\Bin"
+          if (Test-Path (Join-Path $binRoot "x64")) { $candidates += (Resolve-Path (Join-Path $binRoot "x64")).Path } elseif (Test-Path $binRoot) { $candidates += (Resolve-Path $binRoot).Path }
+          if (Test-Path (Join-Path $binRoot "x86")) { $candidates += (Resolve-Path (Join-Path $binRoot "x86")).Path }
+
+          $scripts = Join-Path $slnDir "Build\Release\Scripts"
+          if (Test-Path $scripts) { $candidates += (Resolve-Path $scripts).Path }
+          $shaders = Join-Path $slnDir "Build\Release\Shaders"
+          if (Test-Path $shaders) { $candidates += (Resolve-Path $shaders).Path }
+
+          # Deduplicate and normalize
+          $unique = $candidates | ForEach-Object { (Resolve-Path $_).Path } | Sort-Object -Unique
+
+          if ($unique.Count -eq 0) {
+            Write-Host "$(ts) - No compiled runtime outputs found; aborting packaging"
+            exit 1
+          }
+
+          Write-Host "$(ts) - Staging the following runtime folders:"
+          $unique | ForEach-Object { Write-Host "  $_" }
+
+          # Preserve relative path under Build\Release when possible (so artifact contains Bin\x64)
+          $buildReleaseRoot = Join-Path $slnDir "Build\Release"
+          $buildReleaseRootResolved = $null
+          if (Test-Path $buildReleaseRoot) { $buildReleaseRootResolved = (Resolve-Path $buildReleaseRoot).Path }
+
+          foreach ($src in $unique) {
+            if ($buildReleaseRootResolved -and $src.StartsWith($buildReleaseRootResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+              $rel = $src.Substring($buildReleaseRootResolved.Length).TrimStart('\')
+              $dest = Join-Path $staging $rel
+            } else {
+              $rel = $src.Substring($slnDir.Length).TrimStart('\')
+              $dest = Join-Path $staging $rel
+            }
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            Write-Host "$(ts) - Robocopy $src -> $dest"
+            robocopy $src $dest /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
+            $rc = $LASTEXITCODE
+            Write-Host "$(ts) - robocopy exit code: $rc"
+            if ($rc -ge 8) { Write-Host "$(ts) - robocopy failure ($rc)"; exit $rc }
+          }
+
+          Write-Host "$(ts) - Staged file count and sample listing:"
+          Get-ChildItem -Path $staging -Recurse -File | Select-Object FullName,Length | Sort-Object Length -Descending | Format-Table -AutoSize -Wrap
+
+      - name: Create runtime artifact zip and name by branch
+        shell: pwsh
+        run: |
+          $safe = "${{ steps.vars.outputs.safeBranch }}"
+          $zipName = "TombEngine_${safe}.zip"
+          Write-Host "Compressing artifact_staging -> $zipName"
+          # Remove any inner zips to avoid nested zips
+          $innerZips = Get-ChildItem -Path artifact_staging -Recurse -Filter *.zip -ErrorAction SilentlyContinue
+          if ($innerZips) { $innerZips | ForEach-Object { Remove-Item -Force $_.FullName } }
+          Compress-Archive -Path (Join-Path $PWD "artifact_staging\*") -DestinationPath $zipName -Force -CompressionLevel Optimal
+          New-Item -ItemType Directory -Path build_artifacts -Force | Out-Null
+          Move-Item -Path $zipName -Destination (Join-Path build_artifacts $zipName) -Force
+          Write-Host "Compression complete. Artifact: build_artifacts\$zipName"
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-runtime-${{ steps.vars.outputs.safeBranch }}
+          path: build_artifacts
+
+      - name: Post comment on PR with run link and artifact name
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const branch = '${{ steps.vars.outputs.branch }}';
+            const safe = '${{ steps.vars.outputs.safeBranch }}';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const artifactName = `TombEngine_${safe}.zip`;
+            const body = `Built TombEngine for branch **${branch}**.\n\nDownload the artifact from the workflow run: ${runUrl}\n\nArtifact name: \`${artifactName}\``;
+            const issue_number = context.payload.pull_request.number;
+            await github.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });
+
+      - name: Upload MSBuild logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-msbuild-log-${{ github.run_id }}
+          path: build_logs
+          
+      - name: Cache
+        uses: actions/cache@v5.1.0
+        with:
+          # A list of files, directories, and wildcard patterns to cache and restore
+          path: 
+          # An explicit key for restoring and saving the cache
+          key: 
+          # An ordered multiline string listing the prefix-matched keys, that are used for restoring stale cache if no cache hit occurred for key. Note `cache-hit` returns false in this case.
+          restore-keys: # optional
+          # The chunk size used to split up large files during upload, in bytes
+          upload-chunk-size: # optional
+          # An optional boolean when enabled, allows windows runners to save or restore caches that can be restored or saved respectively on other platforms
+          enableCrossOsArchive: # optional, default is false
+          # Fail the workflow if cache entry is not found
+          fail-on-cache-miss: # optional, default is false
+          # Check if a cache entry exists for the given input(s) (key, restore-keys) without downloading the cache
+          lookup-only: # optional, default is false
+          # Run the post step to save the cache even if another step before fails
+          save-always: # optional, default is false
