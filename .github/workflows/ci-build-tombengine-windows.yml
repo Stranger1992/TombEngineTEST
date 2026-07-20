@@ -14,50 +14,100 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup NuGet tool
+        uses: NuGet/setup-nuget@v1
+
       - name: Diagnose Visual Studio installations
         shell: pwsh
         run: |
           Write-Host "vswhere (MSBuild-capable installations):"
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.Component.MSBuild -property installationPath
-     
-      - name: Setup NuGet (tool)
-        uses: NuGet/setup-nuget@v1
-      
-      - name: Restore NuGet packages (solution-level)
-        shell: pwsh
-        run: |
-          # restore packages for the solution (adjust path if solution is in subfolder)
-          nuget restore "TombEngine\TombEngine.sln" -NonInteractive
 
-      - name: Confirm repo layout (diagnostic)
+      - name: Find solution file
+        id: find_sln
         shell: pwsh
         run: |
-          Write-Host "Top-level files and folders:"
-          Get-ChildItem -Force | Select-Object Name,Mode | Format-Table
-          Write-Host "Show TombEngine folder tree (depth 2):"
-          if (Test-Path .\TombEngine) { Get-ChildItem .\TombEngine -Recurse -Depth 2 | Select-Object FullName,Mode | Format-Table } else { Write-Host "No TombEngine folder at repo root" }
+          Write-Host "Searching repository for .sln files (first match will be used)..."
+          $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sln) {
+            Write-Host "No .sln file found in repository root or subfolders."
+            exit 1
+          }
+          # produce a path relative to the repo root
+          $relative = $sln.FullName.Substring((Get-Location).Path.Length + 1)
+          Write-Host "Found solution: $relative"
+          # export for later steps
+          Write-Output "solutionPath=$relative" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Build TombEngine.sln with MSBuild
+      - name: Restore NuGet packages for discovered solution
         shell: pwsh
         run: |
-          # Locate Visual Studio with MSBuild
+          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
+          if (-not $solutionPath) { Write-Error "No solution path discovered"; exit 1 }
+          Write-Host "Restoring NuGet packages for solution: $solutionPath"
+          nuget restore $solutionPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { Write-Host "nuget restore returned exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      - name: Ensure Microsoft.XAudio2.Redist present (native package)
+        shell: pwsh
+        run: |
+          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
+          $slnDir = Split-Path -Path $solutionPath -Parent
+          $packagesDir = Join-Path $slnDir "packages"
+          Write-Host "Solution directory: $slnDir"
+          Write-Host "Expected packages folder: $packagesDir"
+          $pkgPattern = Join-Path $packagesDir "Microsoft.XAudio2.Redist.*"
+          if (-not (Test-Path $packagesDir) -or -not (Get-ChildItem -Path $pkgPattern -ErrorAction SilentlyContinue)) {
+            Write-Host "Microsoft.XAudio2.Redist not found; installing into solution packages folder..."
+            $tempOut = Join-Path $PWD "nuget_temp_packages"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempOut
+            New-Item -ItemType Directory -Path $tempOut | Out-Null
+            nuget install Microsoft.XAudio2.Redist -Version 1.2.10 -OutputDirectory $tempOut -NonInteractive
+            if ($LASTEXITCODE -ne 0) { Write-Host "nuget install returned exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+            New-Item -ItemType Directory -Path $packagesDir -Force | Out-Null
+            Get-ChildItem -Path $tempOut -Directory | ForEach-Object {
+              $dest = Join-Path $packagesDir $_.Name
+              if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+              Move-Item -Path $_.FullName -Destination $dest
+            }
+            Remove-Item -Recurse -Force $tempOut
+            Write-Host "Microsoft.XAudio2.Redist installed into $packagesDir"
+          } else {
+            Write-Host "Microsoft.XAudio2.Redist already present under $packagesDir"
+          }
+
+      - name: Verify restored packages (diagnostic)
+        shell: pwsh
+        run: |
+          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
+          $projDir = Split-Path -Path $solutionPath -Parent
+          $packagesRoot = Join-Path $projDir "packages"
+          Write-Host "Looking for packages under: $packagesRoot"
+          if (Test-Path $packagesRoot) {
+            Get-ChildItem -Path $packagesRoot -Directory -ErrorAction SilentlyContinue | Select-Object Name | Format-Table
+          } else {
+            Write-Host "No packages folder found at expected location. Listing $projDir contents:"
+            Get-ChildItem -Path $projDir -Force | Select-Object Name,Mode | Format-Table
+          }
+          Write-Host "Check for Microsoft.XAudio2.Redist files:"
+          Get-ChildItem -Path (Join-Path $packagesRoot "Microsoft.XAudio2.Redist*") -Recurse -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+
+      - name: Build solution with MSBuild
+        shell: pwsh
+        run: |
           $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
           if (-not $vsPath) { Write-Error "vswhere did not find Visual Studio with MSBuild."; exit 1 }
           $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
           if (-not (Test-Path $msbuild)) { Write-Error "MSBuild.exe not found at $msbuild"; exit 1 }
 
-          # Solution path inside the repo (adjust if your layout differs)
-          $solutionPath = 'TombEngine.sln'
+          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
           if (-not (Test-Path $solutionPath)) {
             Write-Host "Solution not found at $solutionPath. Listing repo root for diagnosis:"
             Get-ChildItem -Force | Format-Table Name,Mode
             exit 1
           }
 
-          # Absolute log path
           $logFile = Join-Path $PWD "msbuild_tombengine.log"
-
-          # Build args: quote the solution so spaces are preserved; quote /flp argument so semicolon isn't split
           $args = @(
             "`"$solutionPath`"",
             "/t:Rebuild",
@@ -73,7 +123,6 @@ jobs:
           $proc = Start-Process -FilePath $msbuild -ArgumentList $args -Wait -NoNewWindow -PassThru
           $exitCode = $proc.ExitCode
 
-          # Ensure build_logs exists and copy the log if present; create placeholder if not
           New-Item -ItemType Directory -Path build_logs -Force | Out-Null
           if (Test-Path $logFile) {
             Copy-Item -Path $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force
@@ -91,9 +140,9 @@ jobs:
       - name: Show potential outputs for debugging
         shell: pwsh
         run: |
-          Write-Host "Searching for Build and Release folders:"
-          Get-ChildItem -Path . -Recurse -Filter Build -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+          Write-Host "Listing Release and Build folders (may include net48/net6.0 subfolders):"
           Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+          Get-ChildItem -Path . -Recurse -Filter Build -Directory -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
 
       - name: Upload MSBuild logs
         uses: actions/upload-artifact@v4
@@ -105,9 +154,10 @@ jobs:
         shell: pwsh
         run: |
           $zipName = "tombengine_build_${{ github.run_id }}.zip"
-          # Prefer a Build folder at TombEngine\Build or repo root; otherwise include any Release folders found
           $buildCandidates = @()
-          if (Test-Path .\TombEngine\Build) { $buildCandidates += (Resolve-Path .\TombEngine\Build).Path }
+          $slnDir = Split-Path -Path "${{ steps.find_sln.outputs.solutionPath }}" -Parent
+          $candidate1 = Join-Path $slnDir "Build"
+          if (Test-Path $candidate1) { $buildCandidates += (Resolve-Path $candidate1).Path }
           if (Test-Path .\Build) { $buildCandidates += (Resolve-Path .\Build).Path }
           $releaseDirs = Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
           if ($releaseDirs) { $buildCandidates += $releaseDirs }
