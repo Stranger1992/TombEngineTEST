@@ -1,0 +1,66 @@
+name: CI Build Tomb Engine (Windows)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Diagnose VS installations
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.Component.MSBuild -property installationPath
+
+      - name: Build TombEngine.sln with MSBuild
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) { Write-Error "vswhere did not find Visual Studio with MSBuild."; exit 1 }
+          $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
+          if (-not (Test-Path $msbuild)) { Write-Error "MSBuild.exe not found at $msbuild"; exit 1 }
+
+          $solution = '"TombEngine.sln"'
+          $logFile = Join-Path $PWD "msbuild_tombengine.log"
+          $argString = "$solution /t:Rebuild /p:Configuration=Release /m /v:minimal /clp:Summary /fl /flp:logfile=$logFile;verbosity=diagnostic"
+
+          Write-Host "Running MSBuild: $msbuild $argString"
+          & $msbuild --% $argString
+          $exitCode = $LASTEXITCODE
+
+          New-Item -ItemType Directory -Path build_logs -Force | Out-Null
+          if (Test-Path $logFile) { Copy-Item $logFile -Destination (Join-Path build_logs (Split-Path $logFile -Leaf)) -Force } else { New-Item -Path (Join-Path build_logs "msbuild_tombengine.log") -ItemType File -Force | Out-Null }
+
+          if ($exitCode -ne 0) { Write-Host "MSBuild exited with code $exitCode"; exit $exitCode }
+
+      - name: Show outputs
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Filter Release -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
+
+      - name: Upload MSBuild logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-msbuild-log-${{ github.run_id }}
+          path: build_logs
+
+      - name: Package Build folder
+        shell: pwsh
+        run: |
+          $out = "tombengine_build_${{ github.run_id }}.zip"
+          # Adjust path below if the repo outputs to a different Build folder
+          if (Test-Path .\Build) { Compress-Archive -Path .\Build\* -DestinationPath $out -Force } else { Write-Host "No Build folder found; creating empty zip"; New-Item -Path $out -ItemType File -Force | Out-Null }
+          New-Item -ItemType Directory -Path build_artifacts -Force | Out-Null
+          Move-Item $out build_artifacts/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tombengine-build-${{ github.run_id }}
+          path: build_artifacts
