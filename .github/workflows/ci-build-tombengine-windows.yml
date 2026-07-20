@@ -5,6 +5,7 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -23,47 +24,52 @@ jobs:
           Write-Host "vswhere (MSBuild-capable installations):"
           & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -requires Microsoft.Component.MSBuild -property installationPath
 
-      - name: Find solution file
-        id: find_sln
+      - name: Find solution and prepare packages
+        id: find_and_prepare
         shell: pwsh
         run: |
-          Write-Host "Searching repository for .sln files (first match will be used)..."
+          Write-Host "Locating a .sln file in the repository..."
           $sln = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $sln) {
-            Write-Host "No .sln file found in repository root or subfolders."
+            Write-Host "No .sln file found in repository. Aborting."
             exit 1
           }
-          # produce a path relative to the repo root
-          $relative = $sln.FullName.Substring((Get-Location).Path.Length + 1)
-          Write-Host "Found solution: $relative"
-          # export for later steps
-          Write-Output "solutionPath=$relative" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Restore NuGet packages for discovered solution
-        shell: pwsh
-        run: |
-          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
-          if (-not $solutionPath) { Write-Error "No solution path discovered"; exit 1 }
-          Write-Host "Restoring NuGet packages for solution: $solutionPath"
-          nuget restore $solutionPath -NonInteractive
-          if ($LASTEXITCODE -ne 0) { Write-Host "nuget restore returned exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+          # Resolve to absolute path and compute relative path from repo root
+          $slnFull = (Resolve-Path $sln.FullName).Path
+          $repoRoot = (Get-Location).Path
+          $slnRelative = $slnFull.Substring($repoRoot.Length + 1)
+          Write-Host "Found solution (relative): $slnRelative"
+          Write-Host "Found solution (absolute): $slnFull"
 
-      - name: Ensure Microsoft.XAudio2.Redist present (native package)
-        shell: pwsh
-        run: |
-          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
-          $slnDir = Split-Path -Path $solutionPath -Parent
+          # Compute solution directory robustly
+          $slnDir = Split-Path -Path $slnFull -Parent
+          if ([string]::IsNullOrWhiteSpace($slnDir)) {
+            $slnDir = $repoRoot
+            Write-Host "Solution parent was empty; using repo root as solution directory: $slnDir"
+          } else {
+            Write-Host "Solution directory: $slnDir"
+          }
+
+          # Export outputs for later steps
+          Write-Output "solutionPath=$slnRelative" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "solutionDir=$slnDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          # Ensure packages folder exists and check for Microsoft.XAudio2.Redist
           $packagesDir = Join-Path $slnDir "packages"
-          Write-Host "Solution directory: $slnDir"
           Write-Host "Expected packages folder: $packagesDir"
           $pkgPattern = Join-Path $packagesDir "Microsoft.XAudio2.Redist.*"
+
           if (-not (Test-Path $packagesDir) -or -not (Get-ChildItem -Path $pkgPattern -ErrorAction SilentlyContinue)) {
             Write-Host "Microsoft.XAudio2.Redist not found; installing into solution packages folder..."
             $tempOut = Join-Path $PWD "nuget_temp_packages"
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempOut
             New-Item -ItemType Directory -Path $tempOut | Out-Null
             nuget install Microsoft.XAudio2.Redist -Version 1.2.10 -OutputDirectory $tempOut -NonInteractive
-            if ($LASTEXITCODE -ne 0) { Write-Host "nuget install returned exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "nuget install returned exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
             New-Item -ItemType Directory -Path $packagesDir -Force | Out-Null
             Get-ChildItem -Path $tempOut -Directory | ForEach-Object {
               $dest = Join-Path $packagesDir $_.Name
@@ -76,18 +82,26 @@ jobs:
             Write-Host "Microsoft.XAudio2.Redist already present under $packagesDir"
           }
 
+      - name: Restore NuGet packages for discovered solution
+        shell: pwsh
+        run: |
+          $solutionPath = "${{ steps.find_and_prepare.outputs.solutionPath }}"
+          if (-not $solutionPath) { Write-Error "No solution path discovered"; exit 1 }
+          Write-Host "Restoring NuGet packages for solution: $solutionPath"
+          nuget restore $solutionPath -NonInteractive
+          if ($LASTEXITCODE -ne 0) { Write-Host "nuget restore returned exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+
       - name: Verify restored packages (diagnostic)
         shell: pwsh
         run: |
-          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
-          $projDir = Split-Path -Path $solutionPath -Parent
-          $packagesRoot = Join-Path $projDir "packages"
+          $solutionDir = "${{ steps.find_and_prepare.outputs.solutionDir }}"
+          $packagesRoot = Join-Path $solutionDir "packages"
           Write-Host "Looking for packages under: $packagesRoot"
           if (Test-Path $packagesRoot) {
             Get-ChildItem -Path $packagesRoot -Directory -ErrorAction SilentlyContinue | Select-Object Name | Format-Table
           } else {
-            Write-Host "No packages folder found at expected location. Listing $projDir contents:"
-            Get-ChildItem -Path $projDir -Force | Select-Object Name,Mode | Format-Table
+            Write-Host "No packages folder found at expected location. Listing $solutionDir contents:"
+            Get-ChildItem -Path $solutionDir -Force | Select-Object Name,Mode | Format-Table
           }
           Write-Host "Check for Microsoft.XAudio2.Redist files:"
           Get-ChildItem -Path (Join-Path $packagesRoot "Microsoft.XAudio2.Redist*") -Recurse -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table
@@ -100,7 +114,7 @@ jobs:
           $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
           if (-not (Test-Path $msbuild)) { Write-Error "MSBuild.exe not found at $msbuild"; exit 1 }
 
-          $solutionPath = "${{ steps.find_sln.outputs.solutionPath }}"
+          $solutionPath = "${{ steps.find_and_prepare.outputs.solutionPath }}"
           if (-not (Test-Path $solutionPath)) {
             Write-Host "Solution not found at $solutionPath. Listing repo root for diagnosis:"
             Get-ChildItem -Force | Format-Table Name,Mode
@@ -155,10 +169,14 @@ jobs:
         run: |
           $zipName = "tombengine_build_${{ github.run_id }}.zip"
           $buildCandidates = @()
-          $slnDir = Split-Path -Path "${{ steps.find_sln.outputs.solutionPath }}" -Parent
+
+          # Prefer a Build folder under the solution directory, then repo root Build, then any Release folders
+          $slnDir = "${{ steps.find_and_prepare.outputs.solutionDir }}"
           $candidate1 = Join-Path $slnDir "Build"
           if (Test-Path $candidate1) { $buildCandidates += (Resolve-Path $candidate1).Path }
+
           if (Test-Path .\Build) { $buildCandidates += (Resolve-Path .\Build).Path }
+
           $releaseDirs = Get-ChildItem -Path . -Recurse -Filter Release -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
           if ($releaseDirs) { $buildCandidates += $releaseDirs }
 
