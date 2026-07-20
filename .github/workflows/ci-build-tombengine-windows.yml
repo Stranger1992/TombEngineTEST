@@ -204,24 +204,32 @@ jobs:
           Write-Host "$(ts) - Staging the following runtime folders (filtered):"
           $filtered | ForEach-Object { Write-Host "  $_" }
 
+          # Replace the existing foreach loop with this block
           foreach ($src in $filtered) {
-            $leaf = Split-Path -Path $src -Leaf
-
-            # Avoid duplicate leaf names (x64/x86) by prefixing with architecture if needed
-            $destLeaf = $leaf
-            if ($leaf -in @('x64','x86')) {
-              $parentName = Split-Path -Path (Split-Path -Path $src -Parent) -Leaf
-              $destLeaf = "$parentName-$leaf"
+            Write-Host "$(ts) - Processing source: $src"
+          
+            # Determine a stable runtime root to compute a relative path.
+            # Prefer Build\Release as the root; fall back to solution dir if not under Build\Release.
+            $buildReleaseRoot = Join-Path $slnDir "Build\Release"
+            if ($src.StartsWith((Resolve-Path $buildReleaseRoot).Path, [System.StringComparison]::OrdinalIgnoreCase)) {
+              $rel = $src.Substring((Resolve-Path $buildReleaseRoot).Path.Length).TrimStart('\')
+              $stagingSub = Join-Path $staging $rel
+            } else {
+              # If not under Build\Release, compute path relative to solution dir
+              $rel = $src.Substring($slnDir.Length).TrimStart('\')
+              $stagingSub = Join-Path $staging $rel
             }
-
-            $dest = Join-Path $staging $destLeaf
-            Write-Host "$(ts) - Robocopy $src -> $dest"
-            robocopy $src $dest /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
+          
+            # Ensure destination folder exists
+            New-Item -ItemType Directory -Path $stagingSub -Force | Out-Null
+          
+            Write-Host "$(ts) - Robocopy $src -> $stagingSub"
+            robocopy $src $stagingSub /MIR /R:2 /W:2 /NFL /NDL /NJH /NJS
             $rc = $LASTEXITCODE
             Write-Host "$(ts) - robocopy exit code: $rc"
             if ($rc -ge 8) { Write-Host "$(ts) - robocopy failure ($rc)"; exit $rc }
           }
-
+          
           Write-Host "$(ts) - Staged file count and sample listing:"
           Get-ChildItem -Path $staging -Recurse -File | Select-Object FullName,Length | Sort-Object Length -Descending | Format-Table -AutoSize -Wrap
 
@@ -259,3 +267,5 @@ jobs:
         with:
           name: tombengine-msbuild-log-${{ github.run_id }}
           path: build_logs
+
+          
