@@ -1,0 +1,53 @@
+name: Diagnose Solution Files
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  find-sln:
+    runs-on: windows-latest
+    outputs:
+      first_sln: ${{ steps.find_sln.outputs.first_sln }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Print repo root listing
+        shell: pwsh
+        run: |
+          Write-Host "Repository root contents:"
+          Get-ChildItem -Force | Select-Object Name,Mode | Format-Table
+
+      - name: Find all .sln files and print relative paths
+        id: find_sln
+        shell: pwsh
+        run: |
+          Write-Host "Searching for .sln files (this may take a few seconds)..."
+          $slns = Get-ChildItem -Path . -Recurse -Filter *.sln -ErrorAction SilentlyContinue
+          if (-not $slns) {
+            Write-Host "No .sln files found in repository."
+            echo "first_sln="
+            exit 0
+          }
+          Write-Host "Found the following .sln files (relative paths):"
+          foreach ($s in $slns) {
+            $rel = $s.FullName.Substring((Get-Location).Path.Length + 1)
+            Write-Host $rel
+          }
+          # Export the first match as a job output for convenience
+          $first = $slns[0].FullName.Substring((Get-Location).Path.Length + 1)
+          Write-Output "first_sln=$first" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "First .sln (exported as job output): $first"
+
+      - name: Show small tree around first solution (if any)
+        shell: pwsh
+        run: |
+          $first = "${{ steps.find_sln.outputs.first_sln }}"
+          if (-not $first) { Write-Host "No first_sln output; skipping tree step."; exit 0 }
+          $slnDir = Split-Path -Path $first -Parent
+          Write-Host "Showing files under: $slnDir (depth 2)"
+          Get-ChildItem -Path $slnDir -Recurse -Depth 2 | Select-Object FullName,Mode | Format-Table
